@@ -185,6 +185,8 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--hidden"]),
         ))
+        // 外链走系统默认浏览器(经 /api/open-external 调用,webview 内 target=_blank 会被 WebView2 吞掉)
+        .plugin(tauri_plugin_opener::init())
         .setup(move |tauri_app| {
             use tauri::Manager;
 

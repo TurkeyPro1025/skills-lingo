@@ -20,6 +20,7 @@ pub struct EntityRef<'a> {
 }
 
 /// 卡片三元组:概述 + 来源 + 分类
+#[derive(Clone)]
 pub struct Card {
     pub summary: String,
     pub summary_source: &'static str,
@@ -49,8 +50,33 @@ fn str_array(v: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/* ---------- 一级分类体系(category-chips 用),与 Node summaries.js 的表保持一致 ---------- */
+// 固定 7 个一级分类,顺序即展示序;细分标签读取时归并到一级,不重写缓存。
+// 开发与工程 = 原「开发实践/工程流程」合并:真实数据里工程向标签占多数,拆两类边界争议大。
+pub const L1_ORDER: [&str; 7] = ["dev", "writing", "learning", "design", "data", "life", "other"];
+
+/// 分类名(一级中文名或历史细分名)→ 一级 id;未命中归 other。LLM 概述今后只产出一级中文名(见 llm.rs)。
+pub fn to_l1(name: &str) -> &'static str {
+    match name {
+        "开发与工程" | "开发实践" | "前端开发" | "实现与编码" | "代码审查" | "调试" | "测试" | "任务分解"
+        | "推荐系统" | "工程流程" | "项目管理" | "项目配置" | "规格与工单" | "会话管理" | "领域建模"
+        | "需求文档" => "dev",
+        "写作沟通" | "写作" | "沟通模式" | "演示文稿" => "writing",
+        "学习研究" | "学习引导" | "教学材料" | "调研" => "learning",
+        "设计创意" | "设计" | "视觉设计" | "设计智能" | "品牌视觉" | "设计系统" => "design",
+        "数据分析" => "data",
+        "生活效率" | "生活服务" | "旅游规划" | "旅行生活" => "life",
+        _ => "other",
+    }
+}
+
+/// 分类名数组 → 一级 id 数组(保持顺序与长度,卡片细分标签按索引对应)
+pub fn l1_of(names: &[String]) -> Vec<&'static str> {
+    names.iter().map(|n| to_l1(n)).collect()
+}
+
 /// 分类的来源:种子优先,其次中文 LLM 概述缓存
-fn source_categories(entity: &EntityRef, repo: Option<&str>, seeds: &Value, cache: &Cache) -> Vec<String> {
+pub fn source_categories(entity: &EntityRef, repo: Option<&str>, seeds: &Value, cache: &Cache) -> Vec<String> {
     if let Some(seed) = seed_for(entity.dir_name, repo, seeds) {
         let cats = str_array(seed.get("categories"));
         if !cats.is_empty() {

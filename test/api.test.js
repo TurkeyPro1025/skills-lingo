@@ -378,6 +378,7 @@ test('05 种子概述:两仓库生效、分类独立、无种子降级', async (
   assert.equal(alpha.summarySource, 'seed');
   assert.equal(alpha.summary, '种子概述:alpha 是测试技能。');
   assert.deepEqual(alpha.categories, ['种子分类A', '设计'], '分类标签独立于仓库归组');
+  assert.deepEqual(alpha.categoriesL1, ['other', 'design'], '一级分类按索引与细分标签对应');
 
   const cnOne = skillsByDir(data, 'chinese-one')[0];
   assert.equal(cnOne.summarySource, 'seed');
@@ -386,7 +387,11 @@ test('05 种子概述:两仓库生效、分类独立、无种子降级', async (
   assert.match(mono.repoSummary, /示例单仓库/);
 
   const cats = await get(ctx.base, '/api/categories');
-  assert.ok(cats.body.categories.some((c) => c.name === '种子分类A' && c.count === 1));
+  // chips 为固定一级分类:细分「设计」→ design,「种子分类A」不在体系内 → other
+  const L1 = ['dev', 'writing', 'learning', 'design', 'data', 'life', 'other'];
+  assert.ok(cats.body.categories.every((c) => L1.includes(c.name)), 'chips 只出现固定一级分类');
+  assert.ok(cats.body.categories.some((c) => c.name === 'design' && c.count === 1));
+  assert.equal(cats.body.categories[cats.body.categories.length - 1].name, 'other', '「其他」恒居末位');
 });
 
 /* ---------- 06 搜索维度(过滤为纯前端,API 提供全部维度) ---------- */
@@ -479,25 +484,66 @@ test('08 块级对照:块 ID 对齐、代码块不译、占位符保护、单次
   assert.equal(st.state.creditsUsed % 4, 0, '每次调用 4 积分');
 });
 
-test('08 长文分块 + QPS 节流', async () => {
+test('08 长文分块 + 并发限流 + 渐进部分结果', async () => {
   const alpha = skillsByDir((await get(ctx.base, '/api/skills')).body, 'alpha')[0];
   // 懒翻译证明:分析/预翻译阶段从未碰过附属长文档
   assert.ok(!ctx.uapi.stats().hasText('Paragraph 0:'), '附属长文档不应在分析阶段被翻译(懒翻译)');
+  // 模拟真实翻译耗时,让并发与渐进可观察;结束后复原
+  await post(`http://127.0.0.1:${ctx.uapiPort}`, '/__mode', { delay: 300 });
   const before = ctx.uapi.stats().calls;
   const t0 = Date.now();
-  const t = await post(ctx.base, `/api/skills/${alpha.id}/translate`, { path: 'reference-long.md' });
+  // 不 await:并发轮询 GET /translate 捕获渐进部分结果(逐包落盘)。
+  // 首包完成前 blocks 为 null,循环等到"有已完成块"的中间态再断言。
+  const pending = post(ctx.base, `/api/skills/${alpha.id}/translate`, { path: 'reference-long.md' });
+  let part = null;
+  for (let i = 0; i < 40 && !(part && part.blocks && part.done > 0 && part.partial); i++) {
+    await new Promise((r) => setTimeout(r, 120));
+    part = (await get(ctx.base, `/api/skills/${alpha.id}/translate?path=reference-long.md`)).body;
+  }
+  const t = await pending;
   const elapsed = Date.now() - t0;
+  await post(`http://127.0.0.1:${ctx.uapiPort}`, '/__mode', { delay: 0 });
   assert.equal(t.status, 200);
+  assert.ok(part, '翻译进行中 GET /translate 应返回部分结果');
+  assert.equal(part.started, true, '进行中标记 started');
+  assert.equal(part.partial, true, '存在未完成块时 partial');
+  assert.ok(part.total > 0 && part.done > 0 && part.done < part.total, `渐进块进度合法:${part.done}/${part.total}`);
+  assert.ok(part.blocks.some((b) => b.status === 'ok') && part.blocks.some((b) => b.status === 'pending'), '部分块已完成,其余仍在翻译');
+  const fin = (await get(ctx.base, `/api/skills/${alpha.id}/translate?path=reference-long.md`)).body;
+  assert.equal(fin.started, false, '结束后 started 复位');
+  assert.equal(fin.partial, false, '结束后无 pending 块');
   const newCalls = ctx.uapi.stats().calls - before;
+  const maxConc = ctx.uapi.stats().maxConcurrent;
   assert.ok(newCalls >= 3, `4 万字符长文应分多次调用,实际 ${newCalls}`);
+  assert.ok(maxConc >= 2 && maxConc <= 6, `并发在 2..6 之间,实际峰值 ${maxConc}`);
   assert.ok(
     t.body.blocks.filter((b) => b.status === 'ok').length >= 80,
     '长文所有语义块均有译文且不撕裂',
   );
-  assert.ok(elapsed >= (newCalls - 1) * 250 * 0.8, `4 QPS 节流生效:${newCalls} 次调用耗时 ${elapsed}ms`);
+  assert.ok(elapsed >= (newCalls - 1) * 250 * 0.8, `发射间隔节流生效:${newCalls} 次调用耗时 ${elapsed}ms`);
 });
 
 /* ---------- 09 懒翻译与增量缓存 ---------- */
+
+test('09 大包失败二分分包:不逐块降级,告警落盘', async () => {
+  const alpha = skillsByDir((await get(ctx.base, '/api/skills')).body, 'alpha')[0];
+  const detail = (await get(ctx.base, `/api/skills/${alpha.id}`)).body;
+  const raw = fs.readFileSync(path.join(detail.realPath, 'reference-long.md'), 'utf8');
+  const cacheFile = path.join(DATA, 'translations', alpha.id, 'zh', `${sha1(raw)}.json`);
+  fs.rmSync(cacheFile, { force: true }); // 删缓存重翻,触发大包路径
+
+  // >2000 字符的调用必失败(模拟 524:打包目标 3000,部分包超 2000 失败 → 二分成 <2000 小包成功)
+  await post(`http://127.0.0.1:${ctx.uapiPort}`, '/__mode', { failOverChars: 2000 });
+  const r = await post(ctx.base, `/api/skills/${alpha.id}/translate`, { path: 'reference-long.md' });
+  await post(`http://127.0.0.1:${ctx.uapiPort}`, '/__mode', { failOverChars: 0 });
+  assert.equal(r.status, 200);
+  const blocks = r.body.blocks.filter((b) => b.status !== 'original');
+  assert.ok(blocks.every((b) => b.status === 'ok'), '二分分包后全部块成功');
+  // 逐块降级 = 块数(≈85)次调用;二分后调用数应显著低于块数(部分小包一轮成功,超限包二分)
+  assert.ok(r.body.calls < blocks.length * 0.75, `二分分包调用 ${r.body.calls} 应显著低于块数 ${blocks.length}`);
+  assert.ok(Array.isArray(r.body.warnings) && r.body.warnings.length >= 1, '打包失败告警随缓存落盘');
+  assert.match(r.body.warnings[0], /打包翻译失败/, '告警含失败原因');
+});
 
 test('09 附属文档缓存秒开 + 内容未变零调用', async () => {
   const alpha = skillsByDir((await get(ctx.base, '/api/skills')).body, 'alpha')[0];
@@ -534,6 +580,35 @@ test('09 内容变更后自动重翻入口文档', async () => {
   assert.equal(recount, 7, '同步变更拷贝后实体数不变');
 });
 
+test('09 部分缓存续翻:中断的翻译只补剩余块,已完成块零调用', async () => {
+  const beta = skillsByDir((await get(ctx.base, '/api/skills')).body, 'beta')[0];
+  const detail = (await get(ctx.base, `/api/skills/${beta.id}`)).body;
+  // beta 的 SKILL.md 已被预翻译(zh 缓存就绪);把一半块重置为 pending 模拟中断
+  const raw = fs.readFileSync(path.join(detail.realPath, 'SKILL.md'), 'utf8');
+  const cacheFile = path.join(DATA, 'translations', beta.id, 'zh', `${sha1(raw)}.json`);
+  assert.ok(fs.existsSync(cacheFile), '预翻译缓存应存在');
+  const entry = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+  const translatable = entry.blocks.filter((b) => b.status !== 'original');
+  const resetN = Math.ceil(translatable.length / 2);
+  for (const b of translatable.slice(0, resetN)) {
+    b.status = 'pending';
+    b.translated = '';
+  }
+  fs.writeFileSync(cacheFile, JSON.stringify(entry));
+
+  const before = ctx.uapi.stats().calls;
+  const r = await post(ctx.base, `/api/skills/${beta.id}/translate`, { path: 'SKILL.md' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.resumed, resetN, '续翻只补 pending 块');
+  assert.ok(r.body.blocks.every((b) => b.status !== 'pending'), '续翻后无 pending 块');
+  assert.ok(r.body.blocks.filter((b) => b.status === 'ok').length >= translatable.length, '全部块有译文');
+  const newCalls = ctx.uapi.stats().calls - before;
+  assert.ok(newCalls >= 1, `剩余块至少一次调用,实际 ${newCalls}`);
+  const newChars = ctx.uapi.stats().texts.slice(-newCalls).reduce((n, t) => n + t.length, 0);
+  const fullChars = translatable.reduce((n, b) => n + b.src.length, 0);
+  assert.ok(newChars < fullChars * 0.75, `只翻剩余部分:${newChars} < 全文 75%(${fullChars})`);
+});
+
 /* ---------- 10 LLM provider:概述与推断 ---------- */
 
 test('10 概述生成与归属推断(stub LLM)', async () => {
@@ -557,6 +632,18 @@ test('10 概述生成与归属推断(stub LLM)', async () => {
   // 无候选技能不带字段
   const fork = skillsByDir(data, 'beta').find((b) => b.versionLabel === 'claudeA');
   assert.equal(fork.pendingInference, null);
+
+  // 待确认推断读数与卡片同口径:已应用未确认(delta)∪ 未应用候选(lonely);
+  // beta 分岔的负结果推断(LLM 判不出仓库,缓存 null)无可确认项,不计入
+  assert.equal(data.stats.inferred, 2, 'stats.inferred = 已应用未确认 + 未应用候选');
+
+  // 任务面板:/api/status 携带逐阶段清单(手动更新后全部 done/skipped)
+  const st = (await get(ctx.base, '/api/status')).body;
+  const stages = st.phase.stages || [];
+  assert.equal(stages.length, 6, '阶段清单固定 6 项');
+  assert.ok(stages.every((s) => ['done', 'skipped'].includes(s.status)), '完成后各阶段为 done/skipped');
+  assert.ok(stages.some((s) => s.id === 'pretranslate' && s.status === 'done'), '手动触发包含预翻译');
+  assert.ok(stages.some((s) => s.id === 'translateMeta' && s.status === 'skipped'), '中文界面跳过概述翻译');
 });
 
 test('10 未配置 LLM 时优雅降级,不报错不阻塞', async () => {
@@ -569,6 +656,8 @@ test('10 未配置 LLM 时优雅降级,不报错不阻塞', async () => {
   assert.equal(delta.summary, delta.description);
   assert.equal(delta.attribution.repo, null, '未配置 LLM 时不推断');
   assert.equal(ctx.llm.stats().calls, llmBefore, '没有 LLM 调用发生');
+  // 无 LLM 时新技能没有分类来源:卡片一级分类兜底 other,至少能在「其他」chip 里被发现
+  assert.ok(data.skills.every((s) => (s.categoriesL1 || []).length > 0), '无标签卡兜底 other');
   assert.equal(data.stats.entities, 7, '功能不受影响');
   await closeServer(app2.server);
 });
@@ -819,9 +908,9 @@ test('18 同一文档并发翻译只翻一份(in-flight 去重),打包贴满单�
     assert.equal(r2.status, 200);
     const used = ctx.uapi.stats().calls - before;
     assert.equal(used, r1.body.calls, `并发两请求应共享同一份翻译(stub 调用 ${used} = 文档记录 ${r1.body.calls}),而不是翻两遍`);
-    assert.ok(r1.body.calls >= 4, '4 万字符长文按 ~9900/包应分 ≥4 次');
+    assert.ok(r1.body.calls >= 4, '4 万字符长文应分多次调用');
     assert.ok(ctx.uapi.stats().maxLen <= 10000, `单次调用不得超 1 万字符(max=${ctx.uapi.stats().maxLen})`);
-    assert.ok(ctx.uapi.stats().maxLen > 9000, `打包应贴满单次字符上限(max=${ctx.uapi.stats().maxLen})`);
+    assert.ok(ctx.uapi.stats().maxLen > 2000, `打包应贴满打包目标(规避 524,max=${ctx.uapi.stats().maxLen})`);
   } finally {
     await closeServer(app4.server);
   
@@ -1040,7 +1129,8 @@ test('24 语言设置:英文界面摘要=描述,分类/仓库简介翻译并缓�
   assert.ok(mono.repoSummary.startsWith('【EN】'), '仓库简介翻译成英文');
 
   const cats = (await get(ctx.base, '/api/categories?lang=en')).body;
-  assert.ok(cats.categories.some((c) => c.name === '【EN】工程流程'), '翻译后的分类进入筛选');
+  // chips 为固定一级分类(与界面语言无关);卡片细分标签仍走翻译(上方已断言)
+  assert.ok(cats.categories.some((c) => c.name === 'dev'), '一级分类进入筛选(工程流程归并到 dev)');
 
   const cacheFile = path.join(DATA, 'skills', cnEn.id, 'en.json');
   assert.ok(fs.existsSync(cacheFile), '英文概述缓存落盘');

@@ -59,6 +59,16 @@
       </div>
     </header>
 
+    <!-- 后台任务面板:运行中自动展开、空闲自动收起,点标题可手动开合 -->
+    <div id="task-panel" class="task-panel" hidden>
+      <button id="task-panel-head" class="task-panel-head" type="button">
+        <span class="task-dot" id="task-dot" aria-hidden="true"></span>
+        <span id="task-panel-title" data-i18n="task.title">正在执行的任务</span>
+        <span class="task-caret" id="task-caret" aria-hidden="true">▾</span>
+      </button>
+      <div id="task-panel-body" class="task-panel-body"></div>
+    </div>
+
     <div id="stats-bar" class="stats-bar" hidden>
       <span class="stat"><b id="st-skills">–</b><i data-i18n="stats.skills">技能</i></span>
       <span class="stat"><b id="st-repos">–</b><i data-i18n="stats.repos">仓库</i></span>
@@ -72,14 +82,28 @@
       <div id="category-chips" class="chips"></div>
     </div>
 
-    <main id="main">
-      <section id="groups"></section>
-      <section id="empty-state" class="empty" hidden>
-        <div class="empty-icon">🔍</div>
-        <p data-i18n="empty.title">没有匹配的技能</p>
-        <p class="empty-hint" id="empty-hint"></p>
-      </section>
-    </main>
+    <div class="content-row">
+      <!-- 左侧仓库栏:宽度足够=侧栏全名;不足=竖排灰色小横条(悬浮变黑+tooltip 全名);窄窗口隐藏 -->
+      <aside id="repo-rail" class="repo-rail" hidden data-i18n-aria-label="rail.aria"></aside>
+      <main id="main">
+        <section id="groups"></section>
+        <section id="empty-state" class="empty" hidden>
+          <div class="empty-icon">🔍</div>
+          <p data-i18n="empty.title">没有匹配的技能</p>
+          <p class="empty-hint" id="empty-hint"></p>
+        </section>
+      </main>
+    </div>
+
+    <!-- 整理模式:待推断卡片导航(右下角悬浮,与读数条「待确认推断」同口径) -->
+    <div id="pend-nav" class="pend-nav" hidden>
+      <button id="pend-prev" class="pend-btn" type="button" data-i18n-title="pend.prevTitle">▲</button>
+      <span id="pend-count" class="pend-count"></span>
+      <button id="pend-next" class="pend-btn" type="button" data-i18n-title="pend.nextTitle">▼</button>
+    </div>
+
+    <!-- 回到顶部(滚过一屏左右才出现;整理模式下让位于待推断导航) -->
+    <button id="to-top" class="to-top" type="button" data-i18n-title="task.toTop" hidden>↑</button>
   </div>
 
   <!-- 文档查看器 -->

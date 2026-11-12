@@ -34,6 +34,29 @@ impl Cache {
         let _ = write_json_atomic(&self.root.join("index.json"), index);
     }
 
+    // ---- LLM 推断增量缓存:hash 与结果绑定,逐条实时落盘 ----
+    // index.json 只在整轮分析(归属+概述+翻译)末尾写入,推断若不单独落盘,
+    // 中途退出会让已烧掉的 LLM 调用全部作废,下轮从 0 重推。
+    fn inference_file(&self) -> PathBuf {
+        self.root.join("inference.json")
+    }
+
+    pub fn read_inference(&self) -> Value {
+        read_json_if_exists(&self.inference_file())
+            .filter(|v| v.get("entries").map(|e| e.is_object()).unwrap_or(false))
+            .unwrap_or_else(|| json!({ "version": 1, "entries": {} }))
+    }
+
+    pub fn append_inference(&self, id: &str, content_hash: &str, result: &Value) {
+        let mut d = self.read_inference();
+        d["entries"][id] = json!({ "hash": content_hash, "result": result.clone() });
+        let _ = write_json_atomic(&self.inference_file(), &d);
+    }
+
+    pub fn reset_inference(&self) {
+        let _ = write_json_atomic(&self.inference_file(), &json!({ "version": 1, "entries": {} }));
+    }
+
     // ---- 每技能每语言一文件(概述/分类,记录内容哈希做增量) ----
     // v1 布局 skills/{id}.json 是中文概述;读取中文时懒迁移到 skills/{id}/zh.json,
     // 英文等其它语言只读自己的语言段,不会误用中文概述。

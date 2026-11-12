@@ -15,7 +15,7 @@ use crate::summaries::{
 use crate::summary_translate::localize_summaries;
 use crate::util::now_iso;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -87,6 +87,14 @@ pub struct AnalyzerState {
     pending_lang: Mutex<Option<String>>,
 }
 
+#[derive(Clone, Default, serde::Serialize)]
+pub struct Stage {
+    pub id: String,
+    pub status: String,
+    pub done: u64,
+    pub total: u64,
+}
+
 #[derive(Clone, Default)]
 pub struct Progress {
     pub phase: String,
@@ -97,7 +105,12 @@ pub struct Progress {
     pub detail: String,
     pub started_at: Option<String>,
     pub errors: Vec<Value>,
+    /// 任务面板阶段清单(顺序即执行序);status ∈ pending/running/done/skipped
+    pub stages: Vec<Stage>,
 }
+
+/// 阶段 id 固定表,与 Node analyze.js 的 STAGE_IDS 一致
+const STAGE_IDS: [&str; 6] = ["scan", "infer", "attribute", "summarize", "translateMeta", "pretranslate"];
 
 impl Progress {
     fn to_json(&self) -> Value {
@@ -110,6 +123,7 @@ impl Progress {
             "detail": self.detail,
             "startedAt": self.started_at,
             "errors": self.errors,
+            "stages": self.stages,
         })
     }
 
@@ -119,6 +133,34 @@ impl Progress {
         self.params = params;
         let detail: String = detail.into();
         self.detail = detail;
+    }
+
+    fn stage_reset(&mut self) {
+        self.stages = STAGE_IDS
+            .iter()
+            .map(|id| Stage { id: (*id).to_string(), status: "pending".into(), done: 0, total: 0 })
+            .collect();
+    }
+
+    fn stage_status(&mut self, id: &str, status: &str) {
+        if let Some(s) = self.stages.iter_mut().find(|s| s.id == id) {
+            s.status = status.to_string();
+        }
+    }
+
+    fn stage_progress(&mut self, id: &str, done: u64, total: Option<u64>) {
+        if let Some(s) = self.stages.iter_mut().find(|s| s.id == id) {
+            s.done = done;
+            if let Some(t) = total {
+                s.total = t;
+            }
+        }
+    }
+
+    fn stage_tick(&mut self, id: &str) {
+        if let Some(s) = self.stages.iter_mut().find(|s| s.id == id) {
+            s.done += 1;
+        }
     }
 }
 
@@ -245,7 +287,10 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
         detail: "扫描技能根目录…".into(),
         started_at: Some(now_iso()),
         errors: Vec::new(),
+        stages: Vec::new(),
     };
+    progress.stage_reset();
+    progress.stage_status("scan", "running");
     *app.analyzer.progress.lock().await = progress.clone();
 
     let usage0_calls = app.pipeline.provider.stats.calls();
@@ -283,6 +328,9 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
     let scan_result = tokio::task::spawn_blocking(move || scanner::scan(&roots))
         .await
         .unwrap_or_else(|_| scanner::ScanResult { entities: Vec::new(), ignored: Vec::new(), scanned_at: now_iso() });
+    progress.stage_status("scan", "done");
+    progress.stage_progress("scan", scan_result.entities.len() as u64, Some(scan_result.entities.len() as u64));
+    *app.analyzer.progress.lock().await = progress.clone();
 
     progress.stage("attribute", "progress.attributingStart", json!({}), "归属分析…");
     progress.total = scan_result.entities.len() as u64;
@@ -326,8 +374,18 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
         .as_ref()
         .and_then(|v| v.get("lastInference").and_then(|x| x.as_object()).cloned())
         .unwrap_or_default();
+    // 增量缓存:上次分析中断前已落盘的推断(hash 内嵌,优先于 index.lastInference——
+    // 中断轮不会重写 entities,后者对新实体的 hash 校验必然落空)
+    let incremental: Map<String, Value> = app
+        .cache
+        .read_inference()
+        .get("entries")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
 
     let llm_cfg = app.llm_config().await;
+    progress.stage_status("infer", if llm::LlmProvider::configured(&llm_cfg) { "running" } else { "skipped" });
     if llm::LlmProvider::configured(&llm_cfg) {
         for e in &entities {
             let o = overrides_entries.get(&e.id).and_then(|v| v.as_object());
@@ -338,12 +396,23 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
             if base.repo.is_some() {
                 continue;
             }
+            if let Some(inc) = incremental.get(&e.id) {
+                if inc.get("hash").and_then(|v| v.as_str()) == Some(e.content_hash.as_str()) {
+                    last_inference.insert(
+                        e.id.clone(),
+                        attribution_from_index(inc.get("result").unwrap_or(&Value::Null)),
+                    );
+                    progress.stage_tick("infer");
+                    continue;
+                }
+            }
             if let Some(prev) = prev_inference.get(&e.id) {
                 if prev_entities.get(&e.id).map(|h| h == &e.content_hash).unwrap_or(false) {
                     last_inference.insert(
                         e.id.clone(),
                         attribution_from_index(prev),
                     );
+                    progress.stage_tick("infer");
                     continue;
                 }
             }
@@ -382,7 +451,17 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
                     );
                 }
             }
+            // 逐条实时落盘:后续阶段(概述/翻译)耗时更长,中途退出不白烧本次调用。
+            // 调用失败(没有条目)不缓存,保留重试机会
+            if let Some(v) = last_inference.get(&e.id) {
+                let result_json = v.as_ref().map(|a| a.to_json()).unwrap_or(Value::Null);
+                app.cache.append_inference(&e.id, &e.content_hash, &result_json);
+            }
+            progress.stage_tick("infer");
         }
+    }
+    if llm::LlmProvider::configured(&llm_cfg) {
+        progress.stage_status("infer", "done");
     }
 
     // 最终遍:带推断结果与 overrides 走完整瀑布
@@ -393,24 +472,47 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
         last_inference: &last_inference,
     };
     let mut attributions: HashMap<String, Attribution> = HashMap::new();
+    progress.stage_status("attribute", "running");
+    progress.stage_progress("attribute", 0, Some(entities.len() as u64));
     for (i, e) in entities.iter().enumerate() {
         progress.done = i as u64 + 1;
         progress.stage("attribute", "progress.attributing", json!({ "name": e.name }), format!("归属:{}", e.name));
+        progress.stage_progress("attribute", i as u64 + 1, None);
         *app.analyzer.progress.lock().await = progress.clone();
         attributions.insert(e.id.clone(), attribution::resolve(e, &ctx, &overrides_entries, &app.config.lock_files));
     }
+    progress.stage_status("attribute", "done");
 
     // 概述:中文界面走种子/LLM;其它语言 = 描述 + 翻译后的分类/仓库简介(写语言缓存)
     progress.phase = "summaries".into();
     progress.done = 0;
+    progress.total = (entities.len() * 2) as u64;
     *app.analyzer.progress.lock().await = progress.clone();
+
+    // 第一遍:保障中文概述缓存(任何界面语言都执行——新技能的分类标签由此产生,
+    // 翻译阶段随后即可翻到;种子/缓存命中零调用,LLM 结果按 contentHash 落盘不重复调)
+    let mut zh_cards: HashMap<String, Card> = HashMap::new();
+    progress.stage_status("summarize", "running");
+    progress.stage_progress("summarize", 0, Some((entities.len() * 2) as u64));
+    for (i, e) in entities.iter().enumerate() {
+        progress.done = i as u64 + 1;
+        progress.stage("summaries", "progress.summarizing", json!({ "name": e.name }), format!("概述:{}", e.name));
+        progress.stage_progress("summarize", i as u64 + 1, None);
+        *app.analyzer.progress.lock().await = progress.clone();
+        let a = attributions.get(&e.id).unwrap();
+        if let Some(card) = ensure_zh_summary(app, e, a, &llm_cfg, &mut progress).await {
+            zh_cards.insert(e.id.clone(), card);
+        }
+    }
 
     let api_key = app.translate_key().await;
     let provider_ready = app.pipeline.provider.configured(&api_key);
     let mut localized_cards: Option<HashMap<String, Card>> = None;
+    progress.stage_status("translateMeta", "skipped");
     if lang != "zh" && provider_ready {
         let state = app.cache.read_state();
         if state.get("consentTranslate").and_then(|v| v.as_bool()).unwrap_or(false) {
+            progress.stage_status("translateMeta", "running");
             progress.stage("summaries", "progress.translatingMeta", json!({}), "翻译概述/分类/仓库简介…");
             *app.analyzer.progress.lock().await = progress.clone();
             let refs: Vec<EntityRef<'_>> = entities.iter().map(entity_ref_of).collect();
@@ -429,18 +531,19 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
                 }
                 localized_cards = Some(result.cards);
             }
+            progress.stage_status("translateMeta", "done");
         }
     }
 
+    // 第二遍:按界面语言出卡(纯读,不再调 LLM)
     let mut cards: HashMap<String, (String, String, Vec<String>)> = HashMap::new();
     for (i, e) in entities.iter().enumerate() {
-        progress.done = i as u64 + 1;
-        progress.stage("summaries", "progress.summarizing", json!({ "name": e.name }), format!("概述:{}", e.name));
-        *app.analyzer.progress.lock().await = progress.clone();
-        let a = attributions.get(&e.id).unwrap();
-        let card = resolve_card(app, e, a, lang, localized_cards.as_ref(), &llm_cfg, &mut progress).await;
+        progress.done = entities.len() as u64 + i as u64 + 1;
+        progress.stage_progress("summarize", entities.len() as u64 + i as u64 + 1, None);
+        let card = resolve_card(e, lang, localized_cards.as_ref(), zh_cards.get(&e.id));
         cards.insert(e.id.clone(), (card.summary, card.summary_source.to_string(), card.categories));
     }
+    progress.stage_status("summarize", "done");
 
     // 组装索引
     let lock_files_json: Vec<String> = app.config.lock_files.iter().map(|p| p.to_string_lossy().to_string()).collect();
@@ -453,7 +556,22 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
         .collect();
     let linked_merged: u64 = entities.iter().map(|e| e.appearances.len().saturating_sub(1) as u64).sum();
     let attributed_count = attributions.values().filter(|a| a.repo.is_some()).count();
-    let inferred_count = attributions.values().filter(|a| a.inferred && !a.confirmed).count();
+    // 与前端卡片 data-pending 同口径:已应用未确认 ∪ 未应用候选
+    // (负结果推断缓存 value=None 无可确认项,不算;候选已有确认归属也不算)
+    let mut pending_infer_ids: HashSet<&str> = attributions
+        .iter()
+        .filter(|(_, a)| a.inferred && !a.confirmed)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    pending_infer_ids.extend(
+        last_inference
+            .iter()
+            .filter(|(id, cand)| {
+                cand.is_some() && !attributions.get(*id).map(|a| a.confirmed).unwrap_or(false)
+            })
+            .map(|(id, _)| id.as_str()),
+    );
+    let inferred_count = pending_infer_ids.len();
     let last_inference_json: Map<String, Value> = last_inference
         .iter()
         .map(|(k, v)| (k.clone(), v.as_ref().map(|a| a.to_json()).unwrap_or(Value::Null)))
@@ -481,6 +599,10 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
         },
     });
     app.cache.write_index(&index);
+    // 本轮推断结果已随 index.lastInference 落盘,增量缓存清空(避免文件无限增长)
+    if llm::LlmProvider::configured(&llm_cfg) {
+        app.cache.reset_inference();
+    }
 
     // 入口文档预翻译:只在用户显式点「手动更新」时执行(知情、按需烧积分)。
     // 目标 = 当前界面语言:中文界面预翻英文入口,英文界面预翻中文入口。
@@ -491,10 +613,13 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
         let candidates: Vec<&Entity> = entities.iter().filter(|e| e.entry_language != lang).collect();
         progress.total = candidates.len() as u64;
         progress.done = 0;
+        progress.stage_status("pretranslate", "running");
+        progress.stage_progress("pretranslate", 0, Some(candidates.len() as u64));
         *app.analyzer.progress.lock().await = progress.clone();
         for e in &candidates {
             progress.done += 1;
             progress.stage("pretranslate", "progress.pretranslating", json!({ "name": e.name }), format!("预翻译:{}", e.name));
+            progress.stage_progress("pretranslate", progress.done, None);
             *app.analyzer.progress.lock().await = progress.clone();
             if let Err(err) = app.pipeline.ensure_translation(&e.id, &e.real_path, "SKILL.md", &api_key, true, lang).await {
                 if err.code != "provider_unconfigured" {
@@ -507,6 +632,14 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
                     );
                 }
             }
+        }
+        progress.stage_status("pretranslate", "done");
+    }
+
+    // 本轮未走到的阶段(如非手动触发的预翻译)标记为跳过
+    for s in progress.stages.iter_mut() {
+        if s.status == "pending" {
+            s.status = "skipped".into();
         }
     }
 
@@ -540,34 +673,19 @@ async fn analyze(app: &App, trigger: &str, lang: &str) -> Value {
     index
 }
 
-/// 概述解析:中文界面走种子/缓存/LLM;其它语言用翻译后的描述/分类(翻译由 localize_summaries 预先生成)
-async fn resolve_card(
+/// 保障中文概述缓存(种子 → 中文缓存 → LLM,任何界面语言都执行):
+/// 命中即零调用;LLM 生成结果按 contentHash 落盘,内容未变不重复调。
+/// 未配置 LLM / 生成失败返回 None(出卡时降级为描述,分类由 other 兜底)。
+async fn ensure_zh_summary(
     app: &App,
     e: &Entity,
     attribution: &Attribution,
-    lang: &str,
-    localized_cards: Option<&HashMap<String, Card>>,
     llm_cfg: &LlmConfig,
     progress: &mut Progress,
-) -> Card {
+) -> Option<Card> {
     let er = entity_ref_of(e);
-    if lang != "zh" {
-        if let Some(cards) = localized_cards {
-            if let Some(c) = cards.get(&e.id) {
-                return Card {
-                    summary: c.summary.clone(),
-                    summary_source: c.summary_source,
-                    categories: c.categories.clone(),
-                };
-            }
-        }
-        // 翻译不可用或失败:先原文直出(摘要 = frontmatter 描述)
-        return fallback_summary(&er, lang);
-    }
-
-    // 中文界面:种子 → 中文缓存 → LLM → 降级描述
     if let Some(stored) = resolve_stored_summary(&er, attribution.repo.as_deref(), "zh", &app.seeds, &app.cache) {
-        return stored;
+        return Some(stored);
     }
     if llm::LlmProvider::configured(llm_cfg) {
         match app.llm.chat_json(llm_cfg, &llm::build_summary_messages(e)).await {
@@ -586,11 +704,11 @@ async fn resolve_card(
                             "createdAt": now_iso(),
                         }),
                     );
-                    return Card {
+                    return Some(Card {
                         summary: parsed.summary,
                         summary_source: "llm",
                         categories: parsed.categories,
-                    };
+                    });
                 }
             }
             Err(err) => {
@@ -604,7 +722,25 @@ async fn resolve_card(
             }
         }
     }
-    fallback_summary(&er, lang)
+    None
+}
+
+/// 概述解析:中文界面走种子/缓存/LLM;其它语言用翻译后的描述/分类(翻译由 localize_summaries 预先生成)
+/// 出卡(纯读):zh = 种子/缓存(ensure_zh_summary 已保障);其它语言 = 翻译缓存,未命中回退描述
+fn resolve_card(
+    e: &Entity,
+    lang: &str,
+    localized_cards: Option<&HashMap<String, Card>>,
+    zh_card: Option<&Card>,
+) -> Card {
+    if lang != "zh" {
+        if let Some(c) = localized_cards.and_then(|cards| cards.get(&e.id)) {
+            return c.clone();
+        }
+        // 翻译不可用或失败:先原文直出(摘要 = frontmatter 描述)
+        return fallback_summary(&entity_ref_of(e), lang);
+    }
+    zh_card.cloned().unwrap_or_else(|| fallback_summary(&entity_ref_of(e), "zh"))
 }
 
 fn attribution_from_index(v: &Value) -> Option<Attribution> {

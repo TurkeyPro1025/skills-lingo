@@ -7,13 +7,16 @@ const S = {
   data: null,          // /api/skills 响应
   status: null,        // /api/status 响应
   q: '',
-  cat: null,           // 分类筛选:单选(null = 未选)
+  cat: null,           // 分类筛选:null 或 { l1: 一级slug, l2: 细分名|null }
   collapsed: new Set(),
   selectMode: false,
   selection: new Set(),
+  pendId: null,        // 待推断导航光标(卡片 id;null = 尚未定位)
   viewer: null,        // { skill, docs, doc, translation }
   pollTimer: null,
   appearance: null,    // { theme: 'auto'|'dark'|'light', density: 'comfortable'|'compact' }
+  desktop: false,      // 桌面壳环境(/api/status 的 config.desktop,仅桌面端返回 true)
+  taskUserOpen: null,  // 任务面板手动开合覆盖(null = 跟随运行状态自动)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -400,6 +403,14 @@ async function boot() {
     clearTimeout(resizeT);
     resizeT = setTimeout(() => { if (S.data) renderGroups(); }, 150);
   });
+  // 仓库栏 scroll-spy:节流跟随高亮;回到顶部按钮只在滚过一屏左右时出现
+  let railT;
+  window.addEventListener('scroll', () => {
+    $('to-top').hidden = window.scrollY < 480;
+    clearTimeout(railT);
+    railT = setTimeout(updateRailActive, 80);
+  }, { passive: true });
+  $('to-top').addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
   // 整理模式的目标仓库下拉(仅列已有仓库;选项随数据刷新)
   repoDropdown = createDropdown({
     ariaLabel: t('selection.repoAria'),
@@ -413,7 +424,23 @@ async function boot() {
   });
   $('llm-preset').appendChild(presetDropdown.el);
   // 读数条「待确认推断」:进入整理模式并跳转到第一个待推断卡片
-  $('st-infer').addEventListener('click', jumpToPendingCard);
+  $('st-infer').addEventListener('click', () => navPending(1));
+  // 整理模式右下角 ↑/↓ 待推断导航
+  $('pend-prev').addEventListener('click', () => navPending(-1));
+  $('pend-next').addEventListener('click', () => navPending(1));
+  // 桌面 WebView2 会吞掉 target=_blank:拦截后交桌面端点用系统默认浏览器打开(web 端不走此分支)
+  document.addEventListener('click', (e) => {
+    if (!S.desktop) return;
+    const a = e.target.closest('a[target="_blank"]');
+    if (!a) return;
+    e.preventDefault();
+    if (!/^https?:/i.test(a.href)) return;
+    api('/api/open-external', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: a.href }),
+    }).catch(() => toast(t('toast.openExternalFailed'), true));
+  });
 
   $('search').addEventListener('input', (e) => { S.q = e.target.value.trim(); renderGroups(); });
   $('btn-update').addEventListener('click', manualUpdate);
@@ -452,9 +479,20 @@ async function boot() {
   $('set-autostart').addEventListener('change', saveDesktopSettings);
   $('set-close-exit').addEventListener('change', saveDesktopSettings);
 
+  // 任务面板:点标题手动展开/收起(运行状态切换时回到自动行为)
+  $('task-panel-head').addEventListener('click', () => {
+    S.taskUserOpen = $('task-panel-body').hidden;
+    renderTaskPanel();
+  });
+
   await refreshData();
-  pollStatus();
-  setInterval(pollStatus, 4000);
+  // 自适应轮询:分析任务运行时 1s(任务面板细节即时可见),空闲 4s。
+  // 文档翻译进度走 GET /translate 独立通道渐进拉取,不再加密 status
+  const pollLoop = async () => {
+    await pollStatus();
+    S.pollTimer = setTimeout(pollLoop, S.status?.running ? 1000 : 4000);
+  };
+  pollLoop();
 }
 
 async function refreshData() {
@@ -483,9 +521,13 @@ async function pollStatus() {
   try {
     S.status = await api('/api/status');
   } catch { return; }
+  S.desktop = Boolean(S.status.config?.desktop);
   renderProgress();
+  renderTaskPanel();
   if (!S.status.hasIndex && S.data === null) setTimeout(refreshData, 1200);
   if (S.status.running && S._wasRunning === false) refreshData();
+  // 运行状态切换:面板回到自动行为(新一轮自动展开/空闲自动收起)
+  if (S.status.running !== S._wasRunning) S.taskUserOpen = null;
   S._wasRunning = S.status.running;
   if (S.status.running && S.data) {
     // 分析完成后刷新一次列表
@@ -503,6 +545,7 @@ async function manualUpdate() {
       body: JSON.stringify({ lang: I18N.lang }),
     });
     toast(t('toast.updateStarted'));
+    pollStatus(); // 立即轮询:任务面板马上跟进,不等下一个空闲轮询周期
   } catch (err) {
     toast(t('toast.updateFailed', { message: errText(err) }), true);
   } finally {
@@ -551,33 +594,140 @@ function progressDetail(ph) {
   return ph?.detail || '';
 }
 
+/* ============ 后台任务面板(运行中自动展开,空闲自动收起;点标题手动开合) ============ */
+const TASK_STAGE_LABELS = {
+  scan: 'task.scan',
+  infer: 'task.infer',
+  attribute: 'task.attribute',
+  translateMeta: 'task.translateMeta',
+  summarize: 'task.summarize',
+  pretranslate: 'task.pretranslate',
+};
+
+function renderTaskPanel() {
+  const panel = $('task-panel');
+  const st = S.status?.phase;
+  const running = Boolean(S.status?.running) && st && st.phase !== 'idle' && st.phase !== 'done';
+  if (!running && S.taskUserOpen !== true) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const open = S.taskUserOpen ?? true;
+  $('task-panel-body').hidden = !open;
+  $('task-caret').textContent = open ? '▾' : '▸';
+  $('task-dot').className = 'task-dot' + (running ? ' busy' : '');
+  const stages = st?.stages || [];
+  const current = stages.find((s) => s.status === 'running');
+  $('task-panel-title').textContent = running
+    ? t(current ? TASK_STAGE_LABELS[current.id] || 'task.title' : 'task.title')
+    : t('task.idleTitle');
+  const body = $('task-panel-body');
+  const rows = stages.map((s) => {
+    const icon = s.status === 'done' ? '✓'
+      : s.status === 'running' ? '<span class="spin"></span>'
+        : s.status === 'skipped' ? '–' : '·';
+    const count = s.total ? `${s.done}/${s.total}` : (s.done ? String(s.done) : '');
+    return `<div class="task-stage ${s.status}">
+      <span class="task-stage-ic">${icon}</span>
+      <span class="task-stage-name">${esc(t(TASK_STAGE_LABELS[s.id] || s.id))}</span>
+      <span class="task-stage-n">${count}</span>
+    </div>`;
+  });
+  const detail = running ? progressDetail(st) : '';
+  const warnLine = st?.errors?.length
+    ? `<div class="task-warn">⚠ ${esc(t('task.warnings', { n: st.errors.length }))}</div>`
+    : '';
+  body.innerHTML = stages.length
+    ? rows.join('') + (detail ? `<div class="task-detail">${esc(detail)}</div>` : '') + warnLine
+    : `<div class="task-detail">${esc(t('task.noStages'))}</div>`;
+}
+
 function phaseName(p) {
   return hasKey(`phase.${p}`) ? t(`phase.${p}`) : p;
 }
 
-/* ============ 分类筛选 ============ */
+/* ============ 分类筛选(一级固定体系 ⇄ 展开二级细化,纯前端) ============ */
+
+/** 一级分类的展示名内置语言包(不再走翻译接口) */
+function l1Label(id) {
+  return hasKey(`cat.${id}`) ? t(`cat.${id}`) : id;
+}
+
+/** 一级分类下的二级(细分标签)计数:按卡片当前语言的标签聚合,与卡面显示一致 */
+function l2Counts(l1) {
+  const m = new Map();
+  for (const s of S.data?.skills || []) {
+    const l1s = s.categoriesL1 || [];
+    if (!l1s.includes(l1)) continue;
+    (s.categories || []).forEach((c, i) => {
+      if (l1s[i] === l1) m.set(c, (m.get(c) || 0) + 1);
+    });
+  }
+  return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+}
+
+function chipEl({ label, count, on, title, l2, onClick }) {
+  const chip = document.createElement('span');
+  chip.className = 'chip' + (l2 ? ' l2' : '') + (on ? ' on' : '');
+  chip.innerHTML = `${esc(label)}<small>${count ?? ''}</small>`;
+  chip.tabIndex = 0;
+  chip.setAttribute('role', 'button');
+  if (title) chip.title = title;
+  chip.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); chip.click(); } };
+  chip.onclick = onClick;
+  return chip;
+}
+
 function renderCategories() {
   const box = $('category-chips');
   box.innerHTML = '';
-  for (const c of S.data.categories || []) {
-    const chip = document.createElement('span');
-    chip.className = 'chip' + (S.cat === c.name ? ' on' : '');
-    chip.innerHTML = `${esc(c.name)}<small>${c.count}</small>`;
-    chip.tabIndex = 0;
-    chip.setAttribute('role', 'button');
-    chip.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); chip.click(); } };
-    chip.onclick = () => {
-      S.cat = S.cat === c.name ? null : c.name; // 单选:再点一次取消
-      renderCategories();
-      renderGroups();
-    };
-    box.appendChild(chip);
+
+  // 未展开:一级固定体系
+  if (!S.cat) {
+    for (const c of S.data.categories || []) {
+      box.appendChild(chipEl({
+        label: l1Label(c.name),
+        count: c.count,
+        onClick: () => { S.cat = { l1: c.name, l2: null }; renderCategories(); renderGroups(); },
+      }));
+    }
+    return;
+  }
+
+  // 展开态:‹ 返回一级 + 该一级「全部」+ 二级细化(单选,再点一次取消)
+  const { l1, l2 } = S.cat;
+  box.appendChild(chipEl({
+    label: '‹',
+    title: t('cat.back'),
+    onClick: () => { S.cat = null; renderCategories(); renderGroups(); },
+  }));
+  const total = (S.data.categories || []).find((c) => c.name === l1)?.count
+    ?? l2Counts(l1).reduce((n, [, c]) => n + c, 0);
+  box.appendChild(chipEl({
+    label: `${t('cat.all')}·${l1Label(l1)}`,
+    count: total,
+    on: !l2,
+    onClick: () => { S.cat = { l1, l2: null }; renderCategories(); renderGroups(); },
+  }));
+  for (const [name, count] of l2Counts(l1)) {
+    box.appendChild(chipEl({
+      label: name,
+      count,
+      l2: true,
+      on: l2 === name,
+      onClick: () => { S.cat = { l1, l2: l2 === name ? null : name }; renderCategories(); renderGroups(); },
+    }));
   }
 }
 
 /* ============ 过滤(纯前端,不发请求) ============ */
 function matches(card, group) {
-  if (S.cat && !(card.categories || []).includes(S.cat)) return false;
+  if (S.cat) {
+    if (S.cat.l2) {
+      if (!(card.categories || []).includes(S.cat.l2)) return false;
+    } else if (!(card.categoriesL1 || []).includes(S.cat.l1)) return false;
+  }
   if (!S.q) return true;
   const q = S.q.toLowerCase();
   const hay = [
@@ -622,6 +772,7 @@ function renderGroups() {
 
     const sec = document.createElement('section');
     sec.className = 'group' + (S.collapsed.has(group.key) ? ' closed' : '');
+    sec.dataset.gk = group.key; // 待推断导航/仓库栏据此展开折叠仓库与定位
 
     const head = document.createElement('div');
     head.className = 'group-head';
@@ -690,6 +841,48 @@ function renderGroups() {
   }
   // 卡片已入文档:测量并折叠溢出的根徽章
   document.querySelectorAll('#groups .badges').forEach(fitRootBadges);
+  // 仓库栏 sticky 偏移跟随 topbar 实际高度(整理模式多出 selection-bar,topbar 会变高)
+  document.documentElement.style.setProperty('--topbar-h', `${document.querySelector('.topbar')?.offsetHeight || 76}px`);
+  refreshPendNav();
+  renderRepoRail();
+}
+
+/* ============ 左侧仓库栏(宽度足够=侧栏全名;不足=竖排小横条;点击定位+滚动高亮) ============ */
+function renderRepoRail() {
+  const rail = $('repo-rail');
+  if (!rail) return;
+  const secs = [...document.querySelectorAll('#groups .group')];
+  rail.innerHTML = '';
+  rail.hidden = !secs.length;
+  for (const sec of secs) {
+    const meta = (S.data?.groups || []).find((x) => x.key === sec.dataset.gk);
+    const name = meta ? (meta.nameKey ? t(meta.nameKey) : meta.name) : sec.dataset.gk;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'rail-item';
+    btn.dataset.gk = sec.dataset.gk;
+    btn.title = name; // 窄轨模式下悬浮 tooltip 展示全名
+    btn.textContent = name;
+    btn.onclick = () => sec.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    rail.appendChild(btn);
+  }
+  updateRailActive();
+}
+
+/** scroll-spy:视口顶缘最靠近(尚未越过)的分组即当前项 */
+function updateRailActive() {
+  const rail = $('repo-rail');
+  if (!rail || rail.hidden) return;
+  const secs = [...document.querySelectorAll('#groups .group')];
+  if (!secs.length) return;
+  const probe = window.scrollY + 120;
+  let active = secs[0];
+  for (const sec of secs) {
+    if (sec.offsetTop <= probe) active = sec;
+    else break;
+  }
+  const key = active.dataset.gk;
+  rail.querySelectorAll('.rail-item').forEach((b) => b.classList.toggle('on', b.dataset.gk === key));
 }
 
 function isLowConfidence(c) {
@@ -751,8 +944,9 @@ function fitRootBadges(badgesEl) {
 function cardEl(card) {
   const el = document.createElement('div');
   el.className = 'card' + (S.selectMode ? ' selecting' : '') + (S.selection.has(card.id) ? ' selected' : '');
-  // 待确认推断标记:读数条「待确认推断」点击后跳转到第一个此类卡片
-  if (card.pendingInference || isLowConfidence(card)) el.dataset.pending = '1';
+  el.dataset.id = card.id;
+  // 待确认推断标记:与 stats.inferred 同口径(未应用候选 + 已应用未确认),供读数条跳转与 ↑/↓ 导航定位
+  if (card.pendingInference || (card.attribution?.inferred && !card.attribution?.confirmed)) el.dataset.pending = '1';
 
   const badges = [];
   const roots = card.roots || [];
@@ -783,7 +977,7 @@ function cardEl(card) {
   if (card.entryLanguage === 'zh') badges.push(`<span class="badge badge-zh">${esc(t('badge.zh'))}</span>`);
 
   const cats = (card.categories || [])
-    .map((c) => `<span class="cat-tag" data-cat="${esc(c)}">${esc(c)}</span>`).join('');
+    .map((c, i) => `<span class="cat-tag" data-cat="${esc(c)}" data-l1="${esc(card.categoriesL1?.[i] || 'other')}">${esc(c)}</span>`).join('');
 
   el.innerHTML = `
     <input type="checkbox" class="card-check" style="display:${S.selectMode ? 'block' : 'none'}" ${S.selection.has(card.id) ? 'checked' : ''}>
@@ -805,7 +999,7 @@ function cardEl(card) {
   el.onclick = (e) => {
     const cat = e.target.closest('.cat-tag');
     if (cat) {
-      S.cat = cat.dataset.cat; // 单选:点卡片标签即选中该分类
+      S.cat = { l1: cat.dataset.l1 || 'other', l2: null }; // 点卡片细分标签即展开其所属一级分类
       renderCategories();
       renderGroups();
       return;
@@ -827,8 +1021,17 @@ function confidenceLabel(c) {
 
 /* ============ 整理归属(多选 + overrides) ============ */
 
-/** 读数条「待确认推断」:进整理模式 → 展开低置信度折叠区 → 滚动到第一个待推断卡片 */
-function jumpToPendingCard() {
+/** 可见待推断卡片(与 stats.inferred 同口径:未应用候选 + 已应用未确认) */
+function pendingCards() {
+  return [...document.querySelectorAll('#groups .card[data-pending]')];
+}
+
+/**
+ * 待推断导航(读数条「待确认推断」点击与右下角 ↑/↓ 共用),循环轮转:
+ * 清筛选 → 步进光标(末张 ↓ 绕回首张,首张 ↑ 绕到末张) → 展开目标所在折叠仓库/子分组
+ * → 滚动居中 + 短暂高亮。无基准(刚进入/光标卡片已被处理)时两方向都定位第一张。
+ */
+function navPending(dir) {
   if (!S.selectMode) toggleSelectMode(true);
   // 筛选/搜索可能把待推断卡片滤掉:先清条件保证可达
   if (S.q || S.cat) {
@@ -838,13 +1041,49 @@ function jumpToPendingCard() {
     renderCategories();
     renderGroups();
   }
-  document.querySelectorAll('details.subgroup.lowconf').forEach((d) => { d.open = true; });
-  document.querySelector('#groups .card[data-pending]')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  const cards = pendingCards();
+  if (!cards.length) return;
+  const cur = cards.findIndex((c) => c.dataset.id === S.pendId);
+  const next = cur < 0 ? 0 : (cur + dir + cards.length) % cards.length;
+  S.pendId = cards[next].dataset.id;
+  // 目标在折叠仓库里:展开触发整表重绘,元素需按 id 重取
+  let el = cards.find((c) => c.dataset.id === S.pendId);
+  const gk = el?.closest('.group')?.dataset.gk;
+  if (gk && S.collapsed.has(gk)) {
+    S.collapsed.delete(gk);
+    renderGroups();
+    el = pendingCards().find((c) => c.dataset.id === S.pendId);
+  }
+  el?.closest('details.subgroup')?.setAttribute('open', '');
+  el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  el?.classList.remove('pend-flash');
+  void el?.offsetWidth; // 强制回流以重新触发高亮动画
+  el?.classList.add('pend-flash');
+  // 普通步进不触发重渲染,计数需在此即时刷新(renderGroups 内的刷新不足以覆盖)
+  refreshPendNav();
+}
+
+/** 右下角导航的计数与置灰(renderGroups 末尾统一刷新;循环轮转下仅 0 张时置灰) */
+function refreshPendNav() {
+  const nav = $('pend-nav');
+  if (!nav) return;
+  nav.hidden = !S.selectMode;
+  if (!S.selectMode) return;
+  const cards = pendingCards();
+  const idx = cards.findIndex((c) => c.dataset.id === S.pendId);
+  // 当前序号用 <b> 加粗(n/total 均为本方数字,无注入面)
+  $('pend-count').innerHTML = cards.length
+    ? t('pend.counter', { n: `<b>${idx < 0 ? '–' : idx + 1}</b>`, total: cards.length })
+    : esc(t('pend.none'));
+  const noCards = !cards.length;
+  $('pend-prev').disabled = noCards;
+  $('pend-next').disabled = noCards;
 }
 
 function toggleSelectMode(force) {
   S.selectMode = typeof force === 'boolean' ? force : !S.selectMode;
   if (!S.selectMode) S.selection.clear();
+  document.body.classList.toggle('selecting', S.selectMode); // 回到顶部按钮等据此让位
   $('organize-label').textContent = S.selectMode ? t('topbar.organizeExit') : t('topbar.organize');
   // ghost 与 primary 互斥:共存时 hover 会白字白底(.btn-ghost:hover 白底 + .btn-primary:hover 白字)
   $('btn-organize').classList.toggle('btn-primary', S.selectMode);
@@ -1026,21 +1265,42 @@ async function fetchTranslation({ retry } = {}) {
   const v = S.viewer;
   if (!v) return;
   const action = retry ? 'retry' : 'translate';
+  setStatusBanner(`<span class="spin"></span>${esc(retry ? t('viewer.retryingBanner') : t('viewer.translatingBanner'))}`);
+  // POST 完成前每 800ms 渐进拉取已落盘的部分结果:先渲染骨架,再按块 patch
+  let skeleton = false;
   try {
-    setStatusBanner(`<span class="spin"></span>${esc(retry ? t('viewer.retryingBanner') : t('viewer.translatingBanner'))}`);
-    const tr = await api(`/api/skills/${v.skill.id}/${action}`, {
+    const req = api(`/api/skills/${v.skill.id}/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: v.doc.path, lang: I18N.lang }),
-    });
-    // 文档语言与界面语言一致(服务端判定)→ 单栏直出
-    if (tr.language === I18N.lang || !tr.blocks) {
-      renderSingleColumn(v.doc);
-      return;
+    }).then(r => ({ ok: true, r }), err => ({ ok: false, err }));
+    for (;;) {
+      const res = await Promise.race([req, new Promise(r => setTimeout(() => r(null), 800))]);
+      if (res) {
+        if (!res.ok) throw res.err;
+        // 文档语言与界面语言一致(服务端判定)→ 单栏直出
+        if (res.r.language === I18N.lang || !res.r.blocks) {
+          renderSingleColumn(v.doc);
+          return;
+        }
+        v.translation = res.r;
+        setStatusBanner('');
+        renderBilingual(v.doc, res.r);
+        return;
+      }
+      const part = await api(`/api/skills/${v.skill.id}/translate?path=${encodeURIComponent(v.doc.path)}&lang=${encodeURIComponent(I18N.lang)}`).catch(() => null);
+      if (!part?.blocks) {
+        if (part?.started) renderDocBanner(part); // 首包尚未完成:横幅先行
+        continue;
+      }
+      if (!skeleton) {
+        renderBilingual(v.doc, part); // 骨架:全部块就位,未译块显示「翻译中」占位
+        skeleton = true;
+      } else {
+        patchBilingual(v.doc, part); // 增量:只更新状态变化的译文 cell,不重排 DOM
+      }
+      renderDocBanner(part);
     }
-    v.translation = tr;
-    setStatusBanner('');
-    renderBilingual(v.doc, tr);
   } catch (err) {
     if (err.code === 'consent_required') {
       setStatusBanner(t('viewer.consentNeeded'), false);
@@ -1066,6 +1326,39 @@ function setStatusBanner(html, isError) {
   el.className = 'doc-note' + (isError ? ' error' : '');
   el.innerHTML = html || '';
   if (!html) el.remove();
+}
+
+/** 渐进 patch:只更新状态变为 ok/failed 的译文 cell,不重排 DOM(滚动位置不受扰) */
+function patchBilingual(doc, translation) {
+  const tmap = new Map((translation?.blocks || []).map((b) => [b.id, b]));
+  const skillId = S.viewer?.skill?.id;
+  if (!skillId) return;
+  const byId = new Map(doc.blocks.map((b) => [b.id, b]));
+  document.querySelectorAll('#viewer-content .brow[data-bid]').forEach((row) => {
+    const tb = tmap.get(row.dataset.bid);
+    if (!tb || (tb.status !== 'ok' && tb.status !== 'failed')) return;
+    const dst = row.querySelector('.b-dst');
+    if (!dst || dst.dataset.st === tb.status) return; // 状态未变化不重绘
+    dst.dataset.st = tb.status;
+    if (tb.status === 'ok') {
+      dst.className = 'b-dst md';
+      dst.innerHTML = renderBlockMarkdown({ ...byId.get(tb.id), markdown: tb.translated }, skillId, doc.path);
+    } else {
+      dst.className = 'b-dst failed';
+      dst.textContent = t('viewer.translateFailed', { error: tb.error || t('viewer.unknownError') });
+    }
+  });
+}
+
+/** 翻译进度横幅(块数 + 预计积分 + 进度条):数据来自 GET /translate 部分结果 */
+function renderDocBanner(part) {
+  const pct = part.total ? Math.round((part.done / part.total) * 100) : 0;
+  setStatusBanner(`
+    <div class="doc-tr-progress">
+      <div class="progress-bar"><div class="progress-fill" style="width:${Math.max(pct, 4)}%"></div></div>
+      <span>${esc(t('viewer.translatingProgress', { done: part.done, total: part.total, credits: part.creditsEstimated }))}</span>
+    </div>
+    <div class="doc-tr-note">${esc(t('viewer.batchingNote'))}</div>`);
 }
 
 function showConsent() {
@@ -1163,10 +1456,8 @@ function attachCodeCopy(root) {
 function renderBilingual(doc, translation) {
   const tmap = new Map((translation?.blocks || []).map((b) => [b.id, b]));
   const failed = [...tmap.values()].some((b) => b.status === 'failed');
-  const cached = Boolean(translation?.cached);
   $('viewer-meta').innerHTML =
-    (cached ? `<span class="badge badge-confirm">${esc(t('viewer.cached'))}</span>` : '') +
-    (failed ? `<button class="btn" id="btn-retry-doc">${esc(t('viewer.retryFailed'))}</button>` : '');
+    failed ? `<button class="btn" id="btn-retry-doc">${esc(t('viewer.retryFailed'))}</button>` : '';
 
   const retryBtn = $('btn-retry-doc');
   if (retryBtn) retryBtn.onclick = () => fetchTranslation({ retry: true });
@@ -1184,6 +1475,7 @@ function renderBilingual(doc, translation) {
       row.innerHTML = `<div class="md">${renderBlockMarkdown(b, skillId, doc.path)}</div>`;
     } else {
       row.className = 'brow';
+      row.dataset.bid = b.id; // 渐进 patch 按块 id 定位译文 cell
       const tb = tmap.get(b.id);
       let dstHtml;
       if (!translation) {

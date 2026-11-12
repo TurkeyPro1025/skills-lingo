@@ -29,6 +29,7 @@ pub struct TranslateCfg {
     pub preserve_format: bool,
     pub max_chars_per_call: usize,
     pub qps: u32,
+    pub concurrency: usize,
     pub credits_per_call: u64,
     pub response_field: String,
     pub timeout_ms: u64,
@@ -47,9 +48,10 @@ impl Default for TranslateCfg {
             preserve_format: true,
             max_chars_per_call: 10000,
             qps: 4,
+            concurrency: 6,
             credits_per_call: 4,
             response_field: "data.translated_text".into(),
-            timeout_ms: 60000,
+            timeout_ms: 45000,
         }
     }
 }
@@ -181,9 +183,10 @@ pub fn load_config(config_file: Option<&Path>) -> Config {
         preserve_format: tc.get("preserveFormat").and_then(|v| v.as_bool()).unwrap_or(true),
         max_chars_per_call: tc.get("maxCharsPerCall").and_then(|v| v.as_u64()).unwrap_or(10000) as usize,
         qps: tc.get("qps").and_then(|v| v.as_u64()).unwrap_or(4).max(1) as u32,
+        concurrency: tc.get("concurrency").and_then(|v| v.as_u64()).unwrap_or(6).max(1) as usize,
         credits_per_call: tc.get("creditsPerCall").and_then(|v| v.as_u64()).unwrap_or(4),
         response_field: ts("responseField", "data.translated_text"),
-        timeout_ms: tc.get("timeoutMs").and_then(|v| v.as_u64()).unwrap_or(60000),
+        timeout_ms: tc.get("timeoutMs").and_then(|v| v.as_u64()).unwrap_or(45000),
     };
 
     // 相对路径基于配置文件目录(与 Node baseDir 语义一致;绝对路径/展开后的绝对路径直接生效)

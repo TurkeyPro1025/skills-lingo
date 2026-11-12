@@ -1,4 +1,4 @@
-//! UApiPro 翻译适配器(与 Node translate/uapipro.js 对齐):4 QPS 限速、计费统计。
+//! UApiPro 翻译适配器(与 Node translate/uapipro.js 对齐):4 QPS 发射间隔 + 6 并发(官方上限 7)、计费统计。
 
 use crate::config::TranslateCfg;
 use crate::util::Throttle;
@@ -7,6 +7,8 @@ use serde_json::Value;
 pub struct UApiProProvider {
     pub cfg: TranslateCfg,
     throttle: Throttle,
+    /// 并发闸:官方并发上限 7,取配置值(默认 6)留余量;与发射间隔节流互补
+    concurrency: tokio::sync::Semaphore,
     pub stats: crate::stats::Counter,
     client: reqwest::Client,
 }
@@ -20,9 +22,11 @@ pub struct TranslateError {
 impl UApiProProvider {
     pub fn new(cfg: TranslateCfg) -> Self {
         let qps = cfg.qps;
+        let concurrency = cfg.concurrency;
         Self {
             cfg,
             throttle: Throttle::new((1000 / qps as u64).max(1)),
+            concurrency: tokio::sync::Semaphore::new(concurrency),
             stats: crate::stats::Counter::default(),
             client: reqwest::Client::new(),
         }
@@ -50,7 +54,10 @@ impl UApiProProvider {
                 ),
             });
         }
-        let _gate = self.throttle.acquire().await;
+        // 发射间隔守恒(守 QPS):间隔到点即放行下一个请求,不再串行等响应;
+        // 请求本体进并发闸,允许多个在途(官方并发上限 7,默认取 6)
+        drop(self.throttle.acquire().await);
+        let _permit = self.concurrency.acquire().await.expect("concurrency semaphore");
 
         let lang = target_lang.unwrap_or(&self.cfg.target_lang);
         let url = format!("{}?target_lang={}", self.cfg.endpoint, lang);

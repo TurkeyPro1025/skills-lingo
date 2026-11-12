@@ -189,6 +189,10 @@ function copyDir(src, dest) {
 function createFakeUApiPro() {
   const calls = [];
   let failMode = false;
+  let failOverChars = 0; // >0 时:超过该字符数的调用返回 500,模拟大包失败
+  let delayMs = 0; // 模拟真实翻译耗时,让并发可观察
+  let active = 0;
+  let maxConcurrent = 0;
   let failToken = true; // 含 FAIL_TOKEN 的文本失败,用于失败/重试链路测试
 
   function fakeTranslate(text, lang) {
@@ -211,6 +215,7 @@ function createFakeUApiPro() {
         lastTs: calls[calls.length - 1]?.ts ?? null,
         texts: calls.map((c) => c.text.slice(0, 120)),
         langs: calls.map((c) => c.lang),
+        maxConcurrent,
       }));
     }
     if (req.method === 'POST' && url.pathname === '/__mode') {
@@ -220,6 +225,8 @@ function createFakeUApiPro() {
         const mode = JSON.parse(body);
         if (typeof mode.fail === 'boolean') failMode = mode.fail;
         if (typeof mode.failToken === 'boolean') failToken = mode.failToken;
+        if (typeof mode.delay === 'number') delayMs = mode.delay;
+        if (typeof mode.failOverChars === 'number') failOverChars = mode.failOverChars;
         res.writeHead(200); res.end('{}');
       });
       return;
@@ -244,16 +251,23 @@ function createFakeUApiPro() {
           return res.end(JSON.stringify({ message: 'bad body fields' }));
         }
         calls.push({ len: payload.text.length, ts: Date.now(), text: payload.text, lang });
-        if (failMode || (failToken && payload.text.includes('FAIL_TOKEN'))) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify({ message: 'stub translate failure' }));
-        }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          message: 'Translation completed successfully',
-          data: { translated_text: fakeTranslate(payload.text, lang) },
-          performance: { processing_time_ms: 5 },
-        }));
+        active++;
+        maxConcurrent = Math.max(maxConcurrent, active);
+        const finish = () => {
+          active--;
+          if (failMode || (failToken && payload.text.includes('FAIL_TOKEN')) || (failOverChars > 0 && payload.text.length > failOverChars)) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ message: 'stub translate failure' }));
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            message: 'Translation completed successfully',
+            data: { translated_text: fakeTranslate(payload.text, lang) },
+            performance: { processing_time_ms: 5 },
+          }));
+        };
+        if (delayMs > 0) setTimeout(finish, delayMs);
+        else finish();
       });
       return;
     }
@@ -275,6 +289,7 @@ function createFakeUApiPro() {
       lastTs: calls[calls.length - 1]?.ts ?? null,
       texts: calls.map((c) => c.text.slice(0, 120)),
       langs: calls.map((c) => c.lang),
+      maxConcurrent,
       hasText: (sub) => calls.some((c) => c.text.includes(sub)),
       hasLang: (lang) => calls.some((c) => c.lang === lang),
     }),

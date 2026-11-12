@@ -93,7 +93,7 @@ pub fn extract_json(text: &str) -> Option<Value> {
 
 /* ---------- 提示词与响应解析(tasks.js) ---------- */
 
-const SUMMARY_SYSTEM: &str = "你是技能(skill)文档编目员。用户给你一个 Claude/Agent 技能的 SKILL.md 元信息与正文开头,请输出严格的 JSON:\n{\"summary\": \"<2-3 句中文概述,信息密度优先,回答它是什么、什么时候用>\", \"categories\": [\"<1-3 个中文分类标签>\"]}\n只输出 JSON,不要输出其他内容。分类标签从使用者视角出发,如:工程流程、测试、调试、领域建模、调研、写作、教学材料、项目配置、会话管理、设计、前端开发、沟通模式等,也可自拟更贴切的。";
+const SUMMARY_SYSTEM: &str = "你是技能(skill)文档编目员。用户给你一个 Claude/Agent 技能的 SKILL.md 元信息与正文开头,请输出严格的 JSON:\n{\"summary\": \"<2-3 句中文概述,信息密度优先,回答它是什么、什么时候用>\", \"categories\": [\"<1-2 个分类>\"]}\n只输出 JSON,不要输出其他内容。分类必须且只能从这 7 个一级分类里选:开发与工程(编码/测试/调试/规格/项目管理等一切工程向)、写作沟通、学习研究、设计创意、数据分析、生活效率、其他;拿不准就给「其他」,不要自拟。";
 
 const INFERENCE_SYSTEM: &str = "你是技能仓库归属推断器。用户给你一个无安装记录的技能的 SKILL.md 内容和一个已知仓库列表,请推断它最可能来自哪个仓库。\n输出严格 JSON:{\"repo\": \"<owner/repo 或 null>\", \"confidence\": \"high|medium|low\", \"alternatives\": [\"<owner/repo>\", ...]}\n依据:技能名、内容风格、提到过的仓库/作者/URL。没把握就给 low 或 null,不要编造。只输出 JSON。";
 

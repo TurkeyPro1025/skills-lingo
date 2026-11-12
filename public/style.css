@@ -452,6 +452,51 @@ body::before {
 }
 .progress-text { color: var(--ink-2); font-size: 12px; }
 
+/* ---------- 后台任务面板 ---------- */
+.task-panel {
+  margin: 12px 2px 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  overflow: hidden;
+}
+.task-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 9px 14px;
+  border: none;
+  background: none;
+  color: var(--ink-2);
+  font: 12px var(--font-ui);
+  cursor: pointer;
+}
+.task-panel-head:hover { color: var(--accent-ink); }
+.task-caret { margin-left: auto; font-size: 10px; }
+.task-dot {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--neutral-soft);
+  border: 1px solid var(--line);
+}
+.task-dot.busy { background: var(--accent); border-color: var(--accent); box-shadow: 0 0 8px var(--accent-glow); }
+.task-panel-body { padding: 4px 14px 10px; border-top: 1px solid var(--line); }
+.task-stage { display: flex; align-items: center; gap: 10px; padding: 3px 0; font-size: 12px; color: var(--ink-2); }
+.task-stage-ic { flex: 0 0 14px; display: inline-flex; justify-content: center; color: var(--ok); }
+.task-stage .spin { width: 11px; height: 11px; border-width: 2px; }
+.task-stage.running { color: var(--ink); }
+.task-stage.running .task-stage-ic { color: var(--accent-ink); }
+.task-stage.pending .task-stage-ic { color: var(--ink-2); }
+.task-stage.skipped { opacity: 0.6; }
+.task-stage.skipped .task-stage-ic { color: var(--ink-2); }
+.task-stage-name { flex: 1; }
+.task-stage-n { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.task-detail { padding: 4px 0 2px 24px; font-size: 11px; color: var(--ink-2); }
+.task-warn { padding: 6px 0 2px; font-size: 12px; color: var(--warn-ink); }
+
 /* ---------- 概览读数条:让"这个工具最想说的话"成为视觉主角 ---------- */
 .stats-bar {
   display: flex;
@@ -483,6 +528,128 @@ body::before {
 .stat-match b { color: var(--accent-ink); }
 .stat-error { font-size: 13px; color: var(--danger); }
 
+/* ---------- 整理模式:待推断导航(悬浮,贴内容列右缘) ---------- */
+.pend-nav {
+  position: fixed;
+  /* #app 内容列(max-width 1280 + 20px padding)右缘外 24px;窄视口时退回视口右缘 */
+  right: max(24px, calc((100vw - 1280px) / 2 + 44px));
+  bottom: 26px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card-solid); /* 不透明面:避免与底下文字重影 */
+  box-shadow: var(--shadow);
+}
+.pend-btn {
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--neutral-soft);
+  color: var(--ink);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+.pend-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-ink); }
+.pend-btn:disabled { opacity: 0.35; cursor: default; }
+.pend-count { font-size: 11px; color: var(--ink-2); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pend-count b { font-weight: 700; color: var(--ink); font-size: 12px; }
+
+/* 查看器翻译进度横幅 */
+.doc-tr-progress { display: flex; align-items: center; gap: 12px; }
+.doc-tr-progress .progress-bar { flex: 0 0 180px; }
+.doc-tr-progress span { font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.doc-tr-note { margin-top: 4px; font-size: 11px; color: var(--ink-3, var(--ink-2)); opacity: 0.85; }
+.card.pend-flash { animation: pend-flash 1.6s ease; }
+@keyframes pend-flash {
+  0% { box-shadow: 0 0 0 3px var(--accent); border-color: var(--accent); }
+  100% { box-shadow: 0 0 0 3px transparent; }
+}
+
+/* ---------- 回到顶部 ---------- */
+.to-top {
+  position: fixed;
+  /* 与待推断导航同列:贴内容列右缘;整理模式下让位于其上方 */
+  right: max(24px, calc((100vw - 1280px) / 2 + 44px));
+  bottom: 26px;
+  z-index: 40;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--card-solid);
+  color: var(--ink-2);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  transition: bottom 0.2s, color 0.15s, border-color 0.15s;
+}
+.to-top:hover { color: var(--accent-ink); border-color: var(--accent); }
+body.selecting .to-top { bottom: 148px; }
+
+/* ---------- 左侧仓库栏 ---------- */
+.content-row { display: flex; gap: 18px; align-items: flex-start; }
+.content-row > main { flex: 1; min-width: 0; }
+.repo-rail {
+  flex: 0 0 200px;
+  position: sticky;
+  /* topbar 实际高度由 JS 测量写入(整理模式会多出 selection-bar) */
+  top: calc(var(--topbar-h, 76px) + 12px);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: calc(100vh - var(--topbar-h, 76px) - 24px);
+  overflow-y: auto;
+}
+.repo-rail[hidden] { display: none; }
+.rail-item {
+  border: none;
+  border-left: 2px solid transparent;
+  background: none;
+  padding: 4px 8px;
+  text-align: left;
+  color: var(--ink-2);
+  font: 12px var(--font-ui);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.rail-item:hover { color: var(--accent-ink); border-left-color: var(--line-strong); }
+.rail-item.on { color: var(--accent-ink); border-left-color: var(--accent); background: var(--accent-soft); }
+
+/* 中等宽度(900–1100px):侧栏退化为竖排灰色小横条,悬浮/当前项变黑 + tooltip 全名 */
+@media (min-width: 900px) and (max-width: 1099px) {
+  .repo-rail { flex-basis: 20px; gap: 6px; padding: 6px 3px; }
+  .rail-item {
+    height: 5px;
+    padding: 0;
+    border: none;
+    border-radius: 2px;
+    background: var(--ink-2);
+    opacity: 0.45;
+    font-size: 0;
+    color: transparent;
+    transition: background 0.15s, opacity 0.15s;
+  }
+  .rail-item:hover { opacity: 1; background: var(--ink); }
+  .rail-item.on { opacity: 1; background: var(--ink); }
+}
+
+/* 窄窗口:仓库栏整体隐藏 */
+@media (max-width: 899px) {
+  .repo-rail { display: none; }
+}
+
 /* ---------- 工具栏 ---------- */
 .toolbar { margin: 14px 0 16px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -506,6 +673,9 @@ body::before {
   font-weight: 600;
 }
 .chip small { opacity: 0.65; margin-left: 3px; }
+/* 二级(细分)chip:展开态下更小更轻,与一级区分 */
+.chip.l2 { padding: 2px 9px; font-size: 11px; }
+.chip.l2 small { opacity: 0.55; }
 
 .selection-bar {
   width: 100%;

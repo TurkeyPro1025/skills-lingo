@@ -3,7 +3,10 @@
 
 use crate::app::App;
 use crate::languages::normalize_lang;
-use crate::summaries::{fallback_summary, resolve_repo_summary, resolve_stored_summary, EntityRef, SUMMARY_META_VERSION};
+use crate::summaries::{
+    fallback_summary, l1_of, resolve_repo_summary, resolve_stored_summary, source_categories, EntityRef,
+    L1_ORDER, SUMMARY_META_VERSION,
+};
 use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, Request};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -12,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -33,7 +36,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/skills/{id}", get(skill_detail))
         .route("/api/skills/{id}/doc", get(skill_doc))
         .route("/api/skills/{id}/file", get(skill_file))
-        .route("/api/skills/{id}/translate", post(skill_translate))
+        .route("/api/skills/{id}/translate", get(skill_translate_get).post(skill_translate))
         .route("/api/skills/{id}/retry", post(skill_retry))
         .route("/api/consent", post(consent))
         .route("/api/clear-warnings", post(clear_warnings))
@@ -46,6 +49,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/settings/test/llm", post(settings_test_llm))
         .route("/api/settings/test/translate", post(settings_test_translate))
         .route("/api/desktop-settings", get(desktop_settings_get).post(desktop_settings_set))
+        .route("/api/open-external", post(open_external))
         .fallback(fallback)
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn(log_requests))
@@ -309,6 +313,12 @@ fn card_of(app: &App, e: &Value, pending: &Map<String, Value>, lang: &str) -> Va
     let repo = attribution.and_then(|a| a.get("repo")).and_then(|x| x.as_str());
     let resolved = resolve_stored_summary(&er, repo, lang, &app.seeds, &app.cache)
         .unwrap_or_else(|| fallback_summary(&er, lang));
+    // 一级分类按中文源归并(与界面语言无关);与 categories 按索引对应,供 chips 筛选。
+    // 无标签卡(未配 LLM/生成失败)兜底 other:至少能在「其他」里被发现
+    let mut l1_cats = l1_of(&source_categories(&er, repo, &app.seeds, &app.cache));
+    if l1_cats.is_empty() {
+        l1_cats.push("other");
+    }
     json!({
         "id": e.get("id").cloned().unwrap_or(Value::Null),
         "dirName": dir_name,
@@ -318,6 +328,7 @@ fn card_of(app: &App, e: &Value, pending: &Map<String, Value>, lang: &str) -> Va
         "summary": resolved.summary,
         "summarySource": resolved.summary_source,
         "categories": resolved.categories,
+        "categoriesL1": l1_cats,
         "roots": roots_dedup,
         "copyCount": 1 + copies_len,
         "forked": forked,
@@ -468,26 +479,33 @@ async fn categories(
 ) -> Response {
     let idx = app.cache.read_index();
     let lang = request_lang(&app, Some(&params));
-    let mut counts: HashMap<String, u64> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    // 一级分类按中文源归并计数(与界面语言无关);无标签卡计入 other 兜底
+    let mut counts: HashMap<&str, u64> = HashMap::new();
     if let Some(arr) = idx.as_ref().and_then(|i| i.get("entities")).and_then(|v| v.as_array()) {
         for e in arr {
             let er = entity_ref_of(e);
             let repo = e.pointer("/attribution/repo").and_then(|v| v.as_str());
-            let resolved = resolve_stored_summary(&er, repo, &lang, &app.seeds, &app.cache);
-            for c in resolved.map(|r| r.categories).unwrap_or_default() {
-                if !counts.contains_key(&c) {
-                    order.push(c.clone());
+            let cats = source_categories(&er, repo, &app.seeds, &app.cache);
+            if cats.is_empty() {
+                *counts.entry("other").or_insert(0) += 1;
+                continue;
+            }
+            let mut seen = HashSet::new();
+            for l1 in l1_of(&cats) {
+                if seen.insert(l1) {
+                    *counts.entry(l1).or_insert(0) += 1;
                 }
-                *counts.entry(c).or_insert(0) += 1;
             }
         }
     }
-    let mut list: Vec<(String, u64)> = order.into_iter().map(|n| (n.clone(), counts[&n])).collect();
-    list.sort_by(|a, b| b.1.cmp(&a.1));
+    let list: Vec<Value> = L1_ORDER
+        .iter()
+        .filter(|id| counts.contains_key(*id))
+        .map(|id| json!({ "name": id, "count": counts[*id] }))
+        .collect();
     Json(json!({
         "language": lang,
-        "categories": list.into_iter().map(|(name, count)| json!({ "name": name, "count": count })).collect::<Vec<_>>(),
+        "categories": list,
     }))
     .into_response()
 }
@@ -644,6 +662,65 @@ async fn skill_translate(
     body: Bytes,
 ) -> Response {
     translate_or_retry(app, id, body, false).await
+}
+
+/// 渐进拉取:翻译进行中返回已落盘的部分结果(块级 status),供查看器增量渲染。
+/// started = 该文档正在翻译(POST 尚未返回);blocks 为 null 表示首包尚未完成。
+async fn skill_translate_get(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    AxumPath(id): AxumPath<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(e) = current_entity(&app, &id) else {
+        return err_json("not_found", "技能不存在", Some(json!({ "id": id })), StatusCode::NOT_FOUND);
+    };
+    let doc_path = params.get("path").cloned().unwrap_or_else(|| "SKILL.md".into());
+    let real_path = e.get("realPath").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let raw = match std::fs::read_to_string(std::path::Path::new(&real_path).join(&doc_path)) {
+        Ok(r) => r,
+        Err(_) => return err_json("doc_unreadable", "文档不存在", Some(json!({ "path": doc_path })), StatusCode::NOT_FOUND),
+    };
+    let lang = request_lang(&app, Some(&params));
+    let entry = app.pipeline.cached_translation(&id, &lang, &crate::util::sha1_hex(&raw));
+    let blocks = entry.as_ref().and_then(|v| v.get("blocks")).cloned().unwrap_or(Value::Null);
+    let arr = blocks.as_array();
+    let is_status = |want: &str, b: &&Value| b.get("status").and_then(|s| s.as_str()) == Some(want);
+    let partial = arr.map(|a| a.iter().any(|b| is_status("pending", &b))).unwrap_or(false);
+    let dp = app.pipeline.doc_progress();
+    let started = dp
+        .as_ref()
+        .map(|p| {
+            p.get("skillId").and_then(|v| v.as_str()) == Some(&id)
+                && p.get("doc").and_then(|v| v.as_str()) == Some(&doc_path)
+        })
+        .unwrap_or(false);
+    // started 时优先用管线真值:单包文档首包=末包,落盘前 blocks 为 null。
+    // 进度以「包」计:与接口调用一一对应(完成包数 = 文档级 calls)
+    let dp_field = |name: &str| dp.as_ref().and_then(|p| p.get(name).cloned()).unwrap_or(json!(0));
+    let done = if started {
+        dp_field("callsDone")
+    } else {
+        entry.as_ref().and_then(|v| v.get("calls").cloned()).unwrap_or(json!(0))
+    };
+    let total = if started {
+        dp_field("callsTotal")
+    } else {
+        entry.as_ref().and_then(|v| v.get("calls").cloned()).unwrap_or(json!(0))
+    };
+    let credits_estimated = if started {
+        dp_field("creditsEstimated")
+    } else {
+        entry.as_ref().and_then(|v| v.get("credits").cloned()).unwrap_or(json!(0))
+    };
+    Json(json!({
+        "started": started,
+        "partial": partial,
+        "done": done,
+        "total": total,
+        "creditsEstimated": credits_estimated,
+        "blocks": blocks,
+    }))
+    .into_response()
 }
 
 async fn skill_retry(
@@ -805,6 +882,25 @@ async fn desktop_settings_set(axum::extract::State(app): axum::extract::State<Ar
         crate::apply_autostart(handle, &latest);
     }
     Json(latest).into_response()
+}
+
+/** 桌面 WebView2 不处理 target=_blank:前端拦截后经此端点交给系统默认浏览器(仅 http/https) */
+async fn open_external(axum::extract::State(app): axum::extract::State<Arc<App>>, body: Bytes) -> Response {
+    let payload = parse_body(&body);
+    let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
+    let scheme = url.split(':').next().unwrap_or_default().to_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return err_json("bad_request", "仅支持 http/https 链接", None, StatusCode::BAD_REQUEST);
+    }
+    let handle = match app.tauri_handle.get() {
+        Some(h) => h.clone(),
+        None => return err_json("no_window", "当前无桌面窗口", None, StatusCode::SERVICE_UNAVAILABLE),
+    };
+    use tauri_plugin_opener::OpenerExt;
+    match handle.opener().open_url(url, None::<&str>) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(err) => err_json("open_failed", &format!("打开外部链接失败: {err}"), None, StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 /* ---------- 设置 ---------- */

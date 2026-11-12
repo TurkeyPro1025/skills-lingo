@@ -1,6 +1,6 @@
 [package]
 name = "skills-lingo-desktop"
-version = "1.2.2"
+version = "1.3.0"
 description = "Skills 译站桌面版:多根扫描、lock 归属、中英对照学习(深蓝玻璃拟态)"
 authors = ["skills-lingo contributors"]
 license = "MIT"
@@ -14,6 +14,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "fs", "process"] }
 axum = { version = "0.8", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
